@@ -1,0 +1,36 @@
+========================================
+Host: remote01 (user01@remote01)
+Network latency: 49.906 ms
+========================================
+
+--- Raw SSH (8 commands, 8 connections) ---
+  1. dmesg | tail -100                                               879 ms         0 bytes       0 lines
+  2. dmesg | grep -i 'error\|warn\|crit'                             800 ms         0 bytes       0 lines
+  3. dmesg | grep -i 'nvidia\|xid\|gpu'                              789 ms         0 bytes       0 lines
+  4. journalctl -p err --since '24h ago' --no-pager                  799 ms        16 bytes       0 lines
+  5. journalctl -p warning --since '24h ago' --no-pager              801 ms        16 bytes       0 lines
+  6. journalctl --since '1h ago' --no-pager | tail -50               795 ms      1735 bytes      15 lines
+  7. dmesg | grep -i 'oom\|killed process'                          1049 ms         0 bytes       0 lines
+  8. dmesg | grep -i 'zfs\|i/o error\|ext4\|xfs'                     783 ms         0 bytes       0 lines
+
+  TOTAL: 6695 ms, 1767 bytes dumped into context
+
+--- hauntty (7 commands, 0 new connections) ---
+  1. dmesg --level=err,warn,crit | tail -30                         1161 ms       111 bytes     0 stdout_lines
+  2. dmesg | grep -ci 'error\|warn' || true                         1241 ms       117 bytes     1 stdout_lines
+  3. dmesg | grep -i 'nvidia\|xid\|gpu' | tail -20                  1187 ms       118 bytes     0 stdout_lines
+  4. journalctl -p err --since '24h ago' --no-pager | tail -30      1244 ms       151 bytes     1 stdout_lines
+  5. dmesg | grep -i 'oom\|zfs\|i/o error' | tail -10               1192 ms       121 bytes     0 stdout_lines
+  6. journalctl -p warning --since '24h ago' --no-pager | wc -l     1243 ms       137 bytes     1 stdout_lines
+  7. journalctl -p warning --since '24h ago' --no-pager | grep -vi 'pipewire\|bluetooth\|pulseaudio\|wireplumber' | tail -20   1230 ms       213 bytes     1 stdout_lines
+
+  TOTAL: 8498 ms, 968 bytes consumed by agent
+
+--- Comparison ---
+  Metric                         Raw SSH      hauntty
+  Wall clock                     6695 ms      8498 ms
+  SSH connections                      8            0
+  Context bytes                     1767          968
+  Speed improvement                  .7x
+  Context reduction                 46%%
+

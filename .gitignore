@@ -1,0 +1,20 @@
+# Binaries
+hauntty
+hauntty-linux-*
+hauntty_*
+
+# Sockets
+*.sock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Project-specific
+CLAUDE.md
+TEST_PLAN.md
