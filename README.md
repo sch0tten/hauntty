@@ -66,15 +66,29 @@ In production MLOps — triaging GPU failures across a fleet, auditing hosts aft
 └─────────────────┘                              └──────────────────────────┘
 ```
 
-- **One SSH connection**, tunneled once, reused for all commands
-- **Persistent PTY shell** — CWD, environment, and shell state survive across commands
-- **Parallel sessions** — spawn independent sessions for concurrent work, each with its own shell state and audit log
-- **Structured output** — every command returns metadata (`seq`, `rc`, `stdout_lines`, `stderr_lines`, `cwd`) *before* the payload, so the agent can decide whether to read or skip
-- **Per-command capture** — stdout, stderr, return code, and the command text stored in separate files, readable at any time with offset and limit
-- **Session log** — YAML audit trail per session: every command, timestamp, return code, output size
-- **Corpus log** — centralized JSONL log across all sessions, queryable with `hauntty corpus` and filterable by time, host, session, or failure status
-- **Process monitoring via /proc** — deterministic process classification (running, waiting_input, io_wait, idle, done) using kernel state, not regex heuristics
-- **Self-deploying** — `hauntty connect user@host` SCPs the binary, starts the daemon, forwards the socket. No installation needed.
+## Key Concepts: Sessions and SIDs
+
+A **SID** (Session ID) is a short random identifier (e.g., `38b25f55`) assigned to each shell session managed by hauntty on a remote host.
+
+When you run `hauntty connect user@host`, hauntty creates the **primary session** — the first bash shell on that host. Its SID is the **primary SID**, printed as `HAUNTTY_SID` in the connect output. This is the default target for all commands, and the handle you pass to `-s` in every subsequent call.
+
+If you need parallel work (e.g., run a build while tailing logs), you **spawn** additional sessions:
+
+```bash
+hauntty spawn -s 38b25f55          # returns a new SID, e.g. e1ec8da8
+hauntty exec -s 38b25f55 --target e1ec8da8 "tail -f /var/log/app.log"
+```
+
+The `-s` flag always takes the **primary SID** — it tells the client which daemon to talk to. The `--target` flag routes the command to a specific spawned session. Omit `--target` and the command runs on the primary.
+
+Each session has its own working directory, environment variables, shell state, and audit log. Think of it like tmux panes: the primary is the first pane, `spawn` creates new ones, and they all share one daemon and one SSH tunnel.
+
+`hauntty list` shows all sessions, marking the primary with `*`:
+
+```
+* 38b25f55  user@myserver  /home/user     seq:5  [alive]
+  e1ec8da8  user@myserver  /opt/frontend  seq:2  [alive]
+```
 
 ## Why hauntty Matters
 
@@ -94,25 +108,23 @@ hauntty pays this cost once. `hauntty connect` establishes one SSH tunnel, and e
 
 The shell persistence matters operationally: `cd /opt/app && export ENV=prod` in command 1 is still there in command 40. With raw SSH, every command starts in `$HOME` with a blank environment — the agent wastes commands re-establishing state.
 
-### 2. Wall Clock Efficiency
+The wall clock impact scales with latency. On the same 8-command health check:
 
 | | Raw SSH | hauntty | Improvement |
 |---|---------|---------|---|
-| 8-command health check | 2,388 ms | 1,200 ms | **2x faster** |
-| Same task, 50 ms network latency | 6,910 ms | 2,358 ms | **2.9x faster** |
+| LAN | 2,388 ms | 1,200 ms | **2x faster** |
+| 50 ms network latency | 6,910 ms | 2,358 ms | **2.9x faster** |
 
-The improvement scales with latency because the overhead is per-connection, not per-byte. hauntty eliminates it entirely.
-
-**At fleet scale, this compounds.** Consider a 10,000-server fleet audit — 8 diagnostic commands per host, 80,000 total commands:
+At fleet scale, this compounds. A 10,000-server audit — 8 commands per host, 80,000 total:
 
 | | Raw SSH | hauntty |
 |---|---------|---------|
 | SSH handshakes | 80,000 | 10,000 (one per host) |
 | Connection overhead alone (~800 ms each) | **17.7 hours** | **2.2 hours** |
 
-hauntty is a single static Go binary with native goroutine concurrency. No event loop contention, no GIL, no asyncio compatibility issues with legacy Python libraries. Each host connection is a goroutine — 10,000 concurrent sessions are a scheduling problem, not an architectural one.
+Each host connection is a Go goroutine — a ~4 KB stack, scheduled across all available cores. 10,000 concurrent sessions are a scheduling problem, not an architectural one.
 
-### 3. Token Economy
+### 2. Token Economy
 
 This is the critical advantage.
 
@@ -141,7 +153,51 @@ This is **context drift** — the progressive degradation of an agent's reasonin
 
 In production MLOps — triaging a training failure across 8 GPU nodes, auditing a fleet after a security incident, verifying a rolling deployment — an agent may execute 50-200 commands. At the benchmark average of ~140 KB per raw SSH task, a 50-command session pushes **~900 KB of raw output** into the context window, most of it irrelevant. hauntty's metadata-first design keeps the context clean: the agent reads only the lines that inform its next decision, preserving its capacity to reason over an entire operation instead of drowning in the output of the last three commands.
 
+### 3. Fleet Orchestration
+
+Ansible and Terraform solve orchestration at the declaration layer, but they execute one task at a time per host. When an agent needs to install packages, configure services, and verify state concurrently on the same machine, there's no parallel execution model within that host.
+
+hauntty's spawned sessions provide exactly this. Each session is an isolated track — its own PTY, shell state, working directory, and audit log. Commands serialize within a session (one bash, one command at a time — no races, no locks), but run in true parallel across sessions:
+
+```bash
+# Connect — primary session anchors the daemon
+hauntty connect admin@web-prod-07
+# HAUNTTY_SID=a1b2c3d4
+
+# Spawn parallel tracks for independent workstreams
+hauntty spawn -s a1b2c3d4    # → e5f6a7b8  (package installation)
+hauntty spawn -s a1b2c3d4    # → c9d0e1f2  (configuration)
+hauntty spawn -s a1b2c3d4    # → 34567890  (monitoring/validation)
+
+# All three run simultaneously
+hauntty exec -s a1b2c3d4 --target e5f6a7b8 "apt update && apt install -y nginx postgres redis"
+hauntty exec -s a1b2c3d4 --target c9d0e1f2 "cp /staging/configs/* /etc/app/ && systemctl reload app"
+hauntty exec -s a1b2c3d4 --target 34567890 "journalctl -f -u app --no-pager | head -100"
+
+# Each track is independently auditable
+hauntty read -s a1b2c3d4 --target e5f6a7b8 --seq 1 --stream stderr   # did apt fail?
+hauntty read -s a1b2c3d4 --target c9d0e1f2 --seq 1 --stream stdout   # config reload output
+hauntty read -s a1b2c3d4 --target 34567890 --seq 1 --stream stdout   # app logs during deploy
+
+# Primary session stays clean for orchestration decisions
+hauntty exec -s a1b2c3d4 "systemctl is-active nginx postgres redis app"
+```
+
+| | Ansible / Python SSH | hauntty |
+|---|---|---|
+| **Parallelism** | Cooperative (asyncio) or forked OS processes | Go goroutines, preemptive across all cores |
+| **Per-host concurrency** | One task at a time per host | Up to 16 parallel sessions per host |
+| **Race conditions** | Shared state across async tasks requires manual locking | Session isolation by design — no shared mutable state |
+| **Audit granularity** | Play-level logs (task name + changed/ok/failed) | Per-command stdout/stderr/rc per session, YAML + JSONL logs |
+| **Failure tracing** | Scroll through play output, guess which task failed | `hauntty read --target <sid> --seq N --stream stderr` — exact command, exact output |
+| **SSH overhead** | New connection per task (or ControlMaster with stale socket issues) | One tunnel per host, persistent for the entire operation |
+| **Dependencies** | Python, pip, venv, Paramiko/asyncssh, Jinja2, YAML parser | One static binary, zero dependencies |
+
+This matters most for monitoring at scale. If you run 15 health checks per host serially — the way Zabbix scripts and Ansible plays typically do — one hanging check blocks the remaining 14 and can trigger false "host unreachable" alarms. With hauntty, each check runs in its own session. A stuck `smartctl` scan doesn't delay the `journalctl` query. Every check has its own stdout, stderr, and return code, traceable to its exact session and sequence number.
+
 ## Features
+
+Everything below ships in a single static binary — no plugins, no runtime dependencies.
 
 ### Core
 - **Self-bootstrapping** — `hauntty connect user@host` deploys itself to the remote, starts the daemon, and forwards the socket. No pre-installation required.
@@ -322,6 +378,7 @@ That's all the agent needs. The persistent session, structured metadata, and sel
 
 ## Documentation
 
+- [Context Drift Kills AI Agents Before Latency Does](https://ure.us/articles/context-drift-kills-agents-before-latency/) — the problem that motivated hauntty, with benchmarks
 - [Wire Protocol](docs/protocol.md) — message format, operations, process states
 - [Architecture](docs/architecture.md) — data layout, component design, key decisions
 
