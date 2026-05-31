@@ -218,9 +218,14 @@ Everything below ships in a single static binary — no plugins, no runtime depe
 
 ### Process Monitoring
 - **Deterministic state via /proc** — reads `/proc/<pid>/stat`, `/proc/<pid>/wchan`, `/proc/<pid>/io` to classify commands as `running`, `waiting_input`, `io_wait`, `idle`, or `done`. No regex heuristics.
-- **Interactive prompt detection** — detects when a command is waiting for terminal input via kernel wait channel `n_tty_read`. In `--yes` mode, auto-answers prompts.
-- **Live status** — long-running commands stream periodic updates with CPU%, I/O bytes, elapsed time, and child PID.
-- **Process tree tracking** — monitors child and grandchild processes (pipelines, subshells).
+- **Foreground-group tracking** — classification follows the terminal **foreground process group** (`tpgid`), not "all bash children", so background jobs and leftover children from a previous command can't corrupt the current command's status or mask a prompt.
+- **Interactive prompt detection** — detects when a command is waiting for terminal input via the kernel tty wait channel. In `--yes` mode, auto-answers prompts.
+- **Live status** — long-running commands stream periodic updates with CPU%, I/O bytes, elapsed time, and foreground PID.
+
+### Completion Gate
+- **Deterministic done** — a command's exit code is captured by the shell wrapper; the gate fires on the rc file, not on output heuristics.
+- **Background-job awareness** — if a command leaves `&` jobs running, their PIDs are reported as `background_pids` on completion (instead of silently pretending the work is done).
+- **`hauntty wait`** — block until a process exits (`--pid`) or a command completes (`--seq`). The daemon waits *locally* against `/proc` on the remote host — replacing the `sleep N; ssh host "ps aux | grep proc"` polling dance with one deterministic call.
 
 ### Observability
 - **Peek** — last N lines of raw PTY output (ANSI-stripped). Check what's happening without reading specific command output.
@@ -229,16 +234,19 @@ Everything below ships in a single static binary — no plugins, no runtime depe
 - **Version stamping** — `hauntty version` shows version, git commit, and build date. Deploy decisions based on full version comparison.
 
 ### Resilience
-- **Shell recovery** — detects wrapper loss, zombie bash, hard timeout. Automatically recovers the shell (Ctrl-C + exit + re-inject wrapper).
+- **Self-healing sessions** — if a shell dies (e.g. the command ran `exit`), the session auto-restarts a fresh PTY+bash under the same SID and tells the caller the shell was reset (cwd/env lost). No more "alive" sessions that silently swallow commands.
+- **Safe recovery** — a runaway command is terminated by its **foreground process group** (SIGTERM→SIGKILL), preserving the real exit code; recovery never sends a blind `exit` that could kill a healthy session.
+- **Configurable hard deadline** — `-t <dur>` per exec, plumbed to the daemon; the command is killed at the deadline and the client still receives the verdict.
+- **Verified wrapper injection** — the shell confirms it sourced the wrapper (readiness nonce) before the first command runs, so a loaded host doesn't produce "command not found".
 - **Pipeline debounce** — brief "done" classifications between pipe stages are debounced (2-tick) to avoid false prompt detection.
 - **SSH keepalive** — `ServerAliveInterval=60`, detects dead connections within 3 minutes.
-- **Connection diagnostics** — clear error messages when the tunnel or daemon is down, with remediation hints.
+- **Race-tested concurrency** — connection writes and session state are mutex-guarded; validated with `go test -race` and concurrent multi-session load.
 
 ## Installation
 
 ```bash
 # Install directly via Go
-go install github.com/sch0tten/hauntty@v0.1.0
+go install github.com/sch0tten/hauntty@v0.2.0
 
 # Or build from source with version stamping
 git clone https://github.com/sch0tten/hauntty.git
@@ -306,6 +314,21 @@ hauntty peek -s <sid> -n 50
 hauntty attach <sid>
 ```
 
+### Gate on Completion (no sleep + ps polling)
+
+```bash
+# A command that backgrounds work returns immediately and reports the bg pid:
+hauntty exec -s <sid> "./migrate.sh > migrate.log 2>&1 & echo started"
+#   rc: 0
+#   background_pids: [12345]  (still running; foreground command returned)
+
+# Block until that background process actually exits — daemon waits on local /proc:
+hauntty wait -s <sid> --pid 12345          # → state: exited
+
+# Or block on a previously-started command by sequence number:
+hauntty wait -s <sid> --seq 7 --timeout 1h # → state: done, rc: 0
+```
+
 ### Session Management
 
 ```bash
@@ -355,9 +378,11 @@ Add this block to your agent's context file (`CLAUDE.md`, `.cursorrules`, `GEMIN
 ## hauntty (remote shell)
 Use `hauntty` for all remote host operations. Never use raw `ssh host "cmd"`.
 - `hauntty connect user@host` → returns SID and socket path
-- `hauntty exec -s SID "cmd"` → returns metadata: seq, rc, stdout_lines, stderr_lines, cwd
+- `hauntty exec -s SID "cmd"` → returns metadata: seq, rc, stdout_lines, stderr_lines, cwd, background_pids
 - `hauntty read -s SID --seq N --stream stdout [--offset O --limit L]`
 - `hauntty peek -s SID -n 20` → last N raw PTY lines
+- Long job: `hauntty exec -s SID -t 1h "cmd"` (sets the kill deadline)
+- Backgrounded work (`cmd &`): exec returns `background_pids`; gate with `hauntty wait -s SID --pid N` instead of `sleep`/`ps` polling
 
 **Token discipline:** exec returns stdout_lines — if 0, don't read. Count before read (`wc -l`, `grep -c`). Filter at source (`| tail -N`, `| grep -v noise`). Never run broad queries without piping through tail/grep/wc first.
 ```
@@ -378,19 +403,19 @@ That's all the agent needs. The persistent session, structured metadata, and sel
 
 ## Documentation
 
-- [Context Drift Kills AI Agents Before Latency Does](https://ure.us/articles/context-drift-kills-agents-before-latency/) — the problem that motivated hauntty, with benchmarks
+- [Context Drift Kills AI Agents Before Latency Does](https://ure.us/articles/context-drift-kills-agents-before-latency/) — the problem that motivated hauntty, with benchmarks [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18965251.svg)](https://doi.org/10.5281/zenodo.18965251)
 - [Wire Protocol](docs/protocol.md) — message format, operations, process states
 - [Architecture](docs/architecture.md) — data layout, component design, key decisions
 
 ## Security Notice
 
-hauntty relies on SSH for authentication and transport encryption, but **does not implement its own authentication on the daemon socket**. Any process on the remote host that can access the Unix socket can execute commands as the daemon's user. This means an authenticated user on a shared host could escalate beyond their intended authorization perimeter through the socket.
+hauntty relies on SSH for authentication and transport encryption. As of v0.2.0 the daemon socket and per-command files are created `0600` (owner-only), but the daemon **does not yet implement its own authentication handshake on the socket**. A process running *as the same user* that can open the socket can execute commands through it.
 
-Additional gaps in v0.1.0: command text is persisted as plaintext on disk (risk if commands contain secrets), and `--yes` mode confirms prompts without discrimination.
+As of v0.2.0, pending command files are `0600` and removed immediately after the command is consumed (shrinking the plaintext-on-disk window). Still open: a socket authentication handshake, and `--yes` still confirms any detected prompt without discrimination.
 
-**Recommendation:** Use hauntty only in environments where you trust all users on the remote host — single-tenant servers, dedicated infrastructure, or hosts where SSH access already implies full trust. Do not deploy on shared multi-tenant hosts until socket authentication is implemented.
+**Recommendation:** Use hauntty in environments where you trust the user account it runs as — single-tenant servers, dedicated infrastructure, or hosts where SSH access already implies full trust. Do not deploy where untrusted local users share the daemon's UID until socket authentication lands.
 
-These are the top priorities for the next release. See [TODO.md](TODO.md) for the full roadmap.
+See [SECURITY.md](SECURITY.md) for the threat model and reporting, and [TODO.md](TODO.md) for the roadmap.
 
 ## License
 
