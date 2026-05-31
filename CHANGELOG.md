@@ -82,6 +82,12 @@ omitted when empty). A new-version client talking to an old daemon will get an
   under `go test -race`). Added GitHub Actions CI (`go vet`, `go test -race`,
   cross-compile build).
 
+## [0.1.1] - 2026-03-11
+
+### Changed
+- Documentation: restructured the README, added the sessions/SID concepts and a
+  fleet-orchestration walkthrough.
+
 ## [0.1.0] - 2026-03-09
 
 Initial public release.
@@ -102,5 +108,6 @@ Initial public release.
 - Shell-completion auto-install, SSH keepalive, version stamping.
 
 [Unreleased]: https://github.com/sch0tten/hauntty/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/sch0tten/hauntty/compare/v0.1.0...v0.2.0
+[0.2.0]: https://github.com/sch0tten/hauntty/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/sch0tten/hauntty/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sch0tten/hauntty/releases/tag/v0.1.0
