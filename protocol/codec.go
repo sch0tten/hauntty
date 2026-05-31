@@ -6,11 +6,16 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 )
 
-// Encoder writes line-delimited JSON messages.
+// Encoder writes line-delimited JSON messages. It is safe for concurrent use:
+// each Encode marshals into a single buffer and writes it under a mutex, so
+// frames from different goroutines (e.g. a command monitor and the connection
+// request loop sharing one socket) never interleave at the byte level.
 type Encoder struct {
-	w io.Writer
+	mu sync.Mutex
+	w  io.Writer
 }
 
 func NewEncoder(w io.Writer) *Encoder {
@@ -23,6 +28,9 @@ func (e *Encoder) Encode(v any) error {
 		return fmt.Errorf("marshal: %w", err)
 	}
 	data = append(data, '\n')
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	_, err = e.w.Write(data)
 	return err
 }

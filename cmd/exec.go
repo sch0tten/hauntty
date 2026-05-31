@@ -37,6 +37,7 @@ var execCmd = &cobra.Command{
 			Cmd:            fullCmd,
 			SID:            execTarget,
 			NonInteractive: execYes,
+			TimeoutS:       int(execTimeout.Seconds()),
 		}); err != nil {
 			return fmt.Errorf("send exec: %w", err)
 		}
@@ -58,8 +59,13 @@ var execCmd = &cobra.Command{
 			return nil
 		}
 
-		// Wait for done message with a real deadline on the connection
-		conn.SetReadDeadline(time.Now().Add(execTimeout))
+		// The daemon enforces the hard deadline (execTimeout) and will kill a
+		// runaway command and send a done. The client must wait *longer* than
+		// that so it reliably receives the daemon's verdict instead of racing
+		// it — otherwise a command killed exactly at the deadline looks like a
+		// client-side i/o timeout.
+		clientWait := execTimeout + 30*time.Second
+		conn.SetReadDeadline(time.Now().Add(clientWait))
 
 		for {
 			var resp protocol.Response
@@ -72,7 +78,7 @@ var execCmd = &cobra.Command{
 					resp.State, resp.CPU, resp.IOBytes, resp.Elapsed, resp.ChildPID)
 				// Reset deadline on active states — command is making progress
 				if resp.State != protocol.StateWaitingInput {
-					conn.SetReadDeadline(time.Now().Add(execTimeout))
+					conn.SetReadDeadline(time.Now().Add(clientWait))
 				}
 				continue
 			}
@@ -95,6 +101,9 @@ var execCmd = &cobra.Command{
 				fmt.Printf("stdout_lines: %d\n", resp.StdoutLines)
 				fmt.Printf("stderr_lines: %d\n", resp.StderrLines)
 				fmt.Printf("cwd: %s\n", resp.CWD)
+				if len(resp.BackgroundPIDs) > 0 {
+					fmt.Printf("background_pids: %v  (still running; foreground command returned)\n", resp.BackgroundPIDs)
+				}
 				if resp.Error != "" {
 					fmt.Printf("error: %s\n", resp.Error)
 				}

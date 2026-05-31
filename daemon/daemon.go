@@ -76,6 +76,9 @@ func (d *Daemon) Start() error {
 		sess.Kill()
 		return fmt.Errorf("listen unix: %w", err)
 	}
+	// Restrict the socket to the owner — anyone who can reach it can run
+	// commands as this user.
+	os.Chmod(sockPath, 0600)
 	d.listener = ln
 
 	// Symlink for convenience
@@ -198,6 +201,14 @@ func (d *Daemon) handleConn(conn net.Conn) {
 			}
 			d.handleInput(enc, sess, &req)
 
+		case protocol.OpWait:
+			sess, err := d.resolveSession(req.SID)
+			if err != nil {
+				enc.Encode(&protocol.Response{Op: protocol.OpError, Error: err.Error()})
+				continue
+			}
+			d.handleWait(enc, sess, &req)
+
 		default:
 			enc.Encode(&protocol.Response{
 				Op:    protocol.OpError,
@@ -208,8 +219,8 @@ func (d *Daemon) handleConn(conn net.Conn) {
 }
 
 func (d *Daemon) handleSpawn(enc *protocol.Encoder) {
-	count := d.controller.SessionCount()
-	if count >= MaxSessions {
+	// Fast pre-check to avoid forking a shell we'd immediately discard.
+	if count := d.controller.SessionCount(); count >= MaxSessions {
 		enc.Encode(&protocol.Response{
 			Op:    protocol.OpError,
 			Error: fmt.Sprintf("session limit reached (%d/%d)", count, MaxSessions),
@@ -226,7 +237,13 @@ func (d *Daemon) handleSpawn(enc *protocol.Encoder) {
 		return
 	}
 
-	d.controller.AddSession(sess)
+	// Authoritative, race-free cap enforcement.
+	if err := d.controller.AddSessionLimited(sess, MaxSessions); err != nil {
+		sess.Kill()
+		os.RemoveAll(sess.Dir)
+		enc.Encode(&protocol.Response{Op: protocol.OpError, Error: err.Error()})
+		return
+	}
 	log.Printf("spawned session: %s (dir: %s)", sess.SID, sess.Dir)
 
 	enc.Encode(&protocol.Response{
@@ -240,12 +257,7 @@ func (d *Daemon) handleExec(enc *protocol.Encoder, sess *Session, req *protocol.
 	if seq == 0 {
 		seq = sess.NextSeq()
 	} else {
-		// Ensure seq tracking is updated
-		sess.mu.Lock()
-		if seq > sess.seq {
-			sess.seq = seq
-		}
-		sess.mu.Unlock()
+		sess.BumpSeq(seq)
 	}
 
 	if err := sess.Exec(seq, req.Cmd); err != nil {
@@ -261,8 +273,9 @@ func (d *Daemon) handleExec(enc *protocol.Encoder, sess *Session, req *protocol.
 		Seq: seq,
 	})
 
-	// Delegate monitoring to the controller
-	d.controller.ExecCommand(sess, seq, req.Cmd, enc, req.NonInteractive)
+	// Delegate monitoring to the controller.
+	deadline := time.Duration(req.TimeoutS) * time.Second
+	d.controller.ExecCommand(sess, seq, req.Cmd, enc, req.NonInteractive, deadline)
 }
 
 func (d *Daemon) handleInput(enc *protocol.Encoder, sess *Session, req *protocol.Request) {
@@ -283,6 +296,69 @@ func (d *Daemon) handleInput(enc *protocol.Encoder, sess *Session, req *protocol
 	}
 
 	enc.Encode(&protocol.Response{Op: protocol.OpOK})
+}
+
+// handleWait blocks until a target process exits or a command completes, then
+// returns a single done response. This is the deterministic gate that replaces
+// the "sleep N; ssh host ps aux | grep proc" polling pattern: the daemon waits
+// locally against /proc (or the command's rc file) — no SSH round-trips, no
+// guessed sleep intervals.
+func (d *Daemon) handleWait(enc *protocol.Encoder, sess *Session, req *protocol.Request) {
+	deadline := time.Now().Add(DefaultHardDeadline)
+	if req.TimeoutS > 0 {
+		deadline = time.Now().Add(time.Duration(req.TimeoutS) * time.Second)
+	}
+
+	switch {
+	case req.WaitPID > 0:
+		for {
+			st, err := readProcessState(req.WaitPID)
+			if err != nil || st.State == 'Z' {
+				enc.Encode(&protocol.Response{
+					Op:    protocol.OpDone,
+					State: "exited",
+				})
+				return
+			}
+			if time.Now().After(deadline) {
+				enc.Encode(&protocol.Response{
+					Op:    protocol.OpStatus,
+					State: "timeout",
+					Error: fmt.Sprintf("pid %d still running after wait deadline", req.WaitPID),
+				})
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+
+	case req.Seq > 0:
+		for {
+			done, rc, err := sess.Poll(req.Seq)
+			if err == nil && done {
+				enc.Encode(&protocol.Response{
+					Op:    protocol.OpDone,
+					Seq:   req.Seq,
+					RC:    &rc,
+					State: protocol.StateDone,
+					CWD:   sess.GetCWD(),
+				})
+				return
+			}
+			if time.Now().After(deadline) {
+				enc.Encode(&protocol.Response{
+					Op:    protocol.OpStatus,
+					Seq:   req.Seq,
+					State: "timeout",
+					Error: fmt.Sprintf("command %d still running after wait deadline", req.Seq),
+				})
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+
+	default:
+		enc.Encode(&protocol.Response{Op: protocol.OpError, Error: "wait requires --pid or --seq"})
+	}
 }
 
 func (d *Daemon) handlePoll(enc *protocol.Encoder, sess *Session, req *protocol.Request) {
@@ -382,7 +458,8 @@ func (d *Daemon) handleKill(enc *protocol.Encoder, req *protocol.Request) {
 	}
 }
 
-// Shutdown cleanly stops all sessions and the listener.
+// Shutdown cleanly stops all sessions and the listener, and removes the socket
+// and its well-known symlink so stale entries don't linger.
 func (d *Daemon) Shutdown() {
 	if d.listener != nil {
 		d.listener.Close()
@@ -390,17 +467,9 @@ func (d *Daemon) Shutdown() {
 	}
 
 	d.controller.Shutdown()
-}
 
-// Shutdown cancels all active commands and kills all sessions.
-func (c *Controller) Shutdown() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, handle := range c.commands {
-		handle.Cancel()
-	}
-	for _, sess := range c.sessions {
-		sess.Kill()
+	if d.primarySID != "" {
+		os.Remove(filepath.Join(d.BaseDir, d.primarySID, "hauntty.sock"))
+		os.Remove(fmt.Sprintf("/tmp/hauntty-%s.sock", d.primarySID))
 	}
 }

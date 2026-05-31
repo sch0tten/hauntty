@@ -1,0 +1,32 @@
+{
+  "title": "hauntty: Stateful, observable shell sessions for LLM agents",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "Schotten, Stefano",
+      "orcid": "0009-0000-2131-5448",
+      "affiliation": "URE - Unified Resilience Engineering"
+    }
+  ],
+  "license": "Apache-2.0",
+  "keywords": [
+    "llm agents",
+    "remote shell",
+    "context drift",
+    "ssh",
+    "fleet operations",
+    "observability"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://doi.org/10.5281/zenodo.18965251",
+      "relation": "isDocumentedBy",
+      "resource_type": "publication-article"
+    },
+    {
+      "identifier": "https://github.com/sch0tten/hauntty",
+      "relation": "isSupplementTo",
+      "resource_type": "software"
+    }
+  ]
+}
