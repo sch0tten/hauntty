@@ -23,6 +23,7 @@ const (
 	OpPrompt   = "prompt" // command is waiting for user input
 	OpInput    = "input"  // client sends text to PTY stdin
 	OpSpawn    = "spawn"  // create a new session within this daemon
+	OpWait     = "wait"   // block until a process exits or a command completes
 )
 
 // Command states (used in OpStatus responses)
@@ -46,6 +47,8 @@ type Request struct {
 	SID            string `json:"sid,omitempty"`             // target session (empty = primary); used by exec, read, peek, poll, input, watch, kill
 	NonInteractive bool   `json:"non_interactive,omitempty"` // exec: auto-answer prompts with yes
 	Input          string `json:"input,omitempty"`           // input: text to send to PTY
+	TimeoutS       int    `json:"timeout_s,omitempty"`       // exec/wait: hard deadline in seconds (0 = daemon default)
+	WaitPID        int    `json:"wait_pid,omitempty"`        // wait: block until this PID exits
 }
 
 // Response is the unified response envelope sent from daemon to client.
@@ -66,7 +69,8 @@ type Response struct {
 	CPU         float64       `json:"cpu,omitempty"`     // CPU percentage (status)
 	IOBytes     int64         `json:"io_bytes,omitempty"` // total I/O bytes (status)
 	Elapsed     float64       `json:"elapsed_s,omitempty"` // seconds since exec (status)
-	ChildPID    int           `json:"child_pid,omitempty"` // monitored child PID (status)
+	ChildPID    int           `json:"child_pid,omitempty"` // foreground child PID (status)
+	BackgroundPIDs []int      `json:"background_pids,omitempty"` // lingering background jobs spawned by the command (status, done)
 }
 
 // SessionInfo describes an active session.
